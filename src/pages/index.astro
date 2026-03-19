@@ -51,7 +51,10 @@ const posts = (await getCollection('blog')).sort(
 				{
 					posts.map((post) => (
 						<li>
-							<a href={`/blog/${post.id}/`}>
+							<a
+								href={post.data.externalUrl ?? `/blog/${post.id}/`}
+								{...(post.data.externalUrl ? { target: "_blank" } : {})}
+							>
 								<p class="title">{post.data.title}</p>
 								<p class="date">
 									<FormattedDate date={post.data.pubDate} />
