@@ -1,0 +1,229 @@
+---
+title: "it's a cluster f*ck."
+description: "Running a Kubernetes cluster per tenant is not an infrastructure strategy. It's a punishment. Here's why namespaces, virtual clusters, and more clusters all get it wrong — and what actually works."
+pubDate: 'Mar 18 2026'
+---
+
+*And here's how to stop making it one.*
+
+---
+
+Running a Kubernetes cluster per tenant is not an infrastructure strategy. It's a punishment.
+
+Every new cluster is another control plane to patch, another etcd to back up, another upgrade cycle to coordinate. At 3 tenants it's annoying. At 30 it's a full-time job. At 300 it's a dedicated team. And with AI agents that need ephemeral, isolated environments on demand, the model breaks entirely.
+
+The industry keeps reaching for the same three answers: namespaces, virtual clusters, or more real clusters. None of them are right. Here's why.
+
+---
+
+## The three lies of Kubernetes multi-tenancy
+
+There are three approaches everyone reaches for. They all have the same problem: they make you pay for isolation you don't actually need at the layer you don't actually care about.
+
+### Lie #1: Namespaces are enough
+
+Namespaces give you RBAC. They give you NetworkPolicy. They give you a sense of separation that feels, from a distance, like isolation.
+
+It falls apart the moment a tenant needs cluster-scoped resources. CRDs live at the cluster level. ClusterRoles live at the cluster level. Custom admission webhooks, PodSecurityAdmission policies, API server extensions: all cluster-scoped. The moment one tenant's workload needs a CRD, every tenant sees it. The moment one tenant needs cluster-admin, you've already lost.
+
+Namespaces are fine for trusted internal teams sharing a cluster. They are not multi-tenancy. They are a polite agreement not to look at each other's stuff.
+
+### Lie #2: Virtual clusters solve it
+
+The virtual cluster approach (vcluster being the canonical implementation) creates a separate API server per tenant, which sounds right. Finally, real control plane isolation. Your tenant gets their own Kubernetes API. They can create CRDs. They can do whatever they want.
+
+Except there's a syncer.
+
+The syncer is what makes the virtual cluster's workloads actually run. It watches for Pods, Secrets, ConfigMaps in the virtual cluster and copies them down to the host cluster so the host scheduler can pick them up.
+
+This syncer is the problem:
+
+- It copies resources between layers, introducing sync lag and failure modes
+- Higher-level resources like CRDs, custom controllers, anything the syncer doesn't know about, stay in the virtual cluster and never make it to the host. They just sit there.
+- You're running a full etcd, a full API server, and a full syncer process *per tenant*. That's 128 MB+ of overhead per cluster, minimum. Before you've scheduled a single pod.
+- Provisioning takes 30-60 seconds because you're spinning up real infrastructure.
+
+And the behavioral gaps are the worst part. Your tenant writes a controller that watches a CRD. The CRD lives in the virtual cluster. The actual pods it tries to schedule live in the host cluster. The controller can't see them properly. You get subtle, hard-to-debug inconsistencies that only appear in production.
+
+You traded one set of problems for a different, weirder set of problems.
+
+### Lie #3: Just run more clusters
+
+The nuclear option. Every tenant gets a real cluster. Real isolation. Real control plane. Real everything.
+
+Real bills. Real operational overhead. Real upgrade cycles multiplied by the number of tenants. Real blast radius when a misconfigured cluster takes down something it shouldn't.
+
+At 3 tenants, it's fine. At 30, it's a full-time job. At 300, it's a team. At 3000, it's a company, and that company is probably you.
+
+---
+
+## What's actually wrong
+
+The root issue is a category error: **everyone conflates control plane isolation with data plane isolation**.
+
+Your tenants don't need separate API servers because the infrastructure to run them is independently valuable. They need separate API servers because that's the only way to get proper namespace isolation, CRD isolation, and RBAC isolation simultaneously.
+
+But what if the API server could serve multiple isolated control planes from a single process?
+
+That's not a new API. That's not a sidecar. That's not a syncer copying resources between layers. It's one process, one scheduler, one set of controllers, with path-based isolation per tenant baked directly into the storage layer.
+
+---
+
+## Virtual control planes: a different model
+
+The insight is simple, even if the implementation isn't: the API server doesn't need to be a 1:1 mapping to a cluster. It can serve multiple isolated control planes from a single process, with path-based isolation baked into the storage layer. No separate process per tenant. No syncer. No per-tenant etcd.
+
+Each virtual control plane's data is isolated at rest by key segment, similar to how columns partition data in a table. From the outside it looks and behaves like a real Kubernetes API. RBAC, CRDs, cluster-scoped resources, all isolated per tenant. Every tool that speaks Kubernetes works against it unchanged, because it is Kubernetes, just virtualized at the control plane level rather than the infrastructure level.
+
+The numbers that fall out of this model are very different from what you're used to. ~3 MB overhead per control plane instead of 128 MB+. ~2 second provisioning instead of 30-60 seconds. A single management plane that can serve thousands of virtual control planes without adding infrastructure.
+
+```
+$ brew tap kplane-dev/tap && brew install kplane
+$ kplane up
+$ kp create cluster example
+
+$ kubectl get namespaces --context=example
+# Full Kubernetes API, ready immediately
+```
+
+The reason this works where virtual clusters don't is that there's no translation layer. The scheduler sees real resources. Controllers and informers cache across tenants. Nothing is being copied or synced between layers, so there's no class of bugs that only appear because the syncer didn't handle a particular resource type.
+
+---
+
+## Where this actually matters
+
+### Platform engineering
+
+Your internal developer platform gives every team self-service access to a control plane. They provision in seconds, tear down when done. You operate one management plane instead of a fleet.
+
+No more "hey can someone provision us a new staging environment" tickets sitting in your backlog for three days.
+
+### Cloud multi-tenancy
+
+Your customers need isolated Kubernetes environments. You need to not run a separate cluster per customer. Virtual control planes give you control plane isolation at namespace overhead. One management plane. Thousands of tenants.
+
+### CI/CD and ephemeral testing
+
+Every PR gets its own control plane. Hundreds run concurrently. Full Kubernetes API: not a mock, not a subset, not a "close enough." Real Kubernetes. Real tests. Torn down when the PR closes.
+
+The teams that build on top of Kubernetes, writing operators, controllers, anything that touches the Kubernetes API, finally have a way to test against a real API without the 60-second provisioning tax.
+
+### AI agents managing infrastructure
+
+Agents are moving from running on VMs to managing entire clouds. An agent that manages Kubernetes infrastructure needs a Kubernetes API endpoint it controls. Give each agent its own virtual control plane and its own scheduling view over a shared GPU pool. Full API. No duplicated hardware.
+
+---
+
+## How it's built
+
+One shared API server serves all control planes. Isolation is enforced at the storage layer — each virtual control plane's data is isolated at rest by key segment, similar to how columns partition data in a table. There is no proxy between the client and the API server. kubectl sends standard Kubernetes API requests. The API server processes them natively.
+
+<svg width="100%" viewBox="0 0 680 540" xmlns="http://www.w3.org/2000/svg" style="font-family: sans-serif;">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+
+  {/* Management plane container */}
+  <rect x="100" y="44" width="480" height="220" rx="14" fill="#f5f5f5" stroke="#ccc" stroke-width="0.5"/>
+  <text x="120" y="64" font-size="12" fill="#888">Management plane</text>
+
+  {/* Shared API server */}
+  <rect x="190" y="74" width="300" height="44" rx="8" fill="#e8e4fc" stroke="#a89ee0" stroke-width="0.5"/>
+  <text x="340" y="101" text-anchor="middle" font-size="14" font-weight="500" fill="#3c2e7a">Shared API server</text>
+
+  {/* Storage layer label */}
+  <text x="340" y="138" text-anchor="middle" font-size="12" fill="#888">path-isolated storage</text>
+
+  {/* Key segments */}
+  <rect x="120" y="148" width="72" height="28" rx="6" fill="#eee" stroke="#ccc" stroke-width="0.5"/>
+  <text x="156" y="167" text-anchor="middle" font-size="12" fill="#555">/cp-1</text>
+  <rect x="204" y="148" width="72" height="28" rx="6" fill="#eee" stroke="#ccc" stroke-width="0.5"/>
+  <text x="240" y="167" text-anchor="middle" font-size="12" fill="#555">/cp-2</text>
+  <rect x="288" y="148" width="72" height="28" rx="6" fill="#eee" stroke="#ccc" stroke-width="0.5"/>
+  <text x="324" y="167" text-anchor="middle" font-size="12" fill="#555">/cp-3</text>
+  <rect x="372" y="148" width="72" height="28" rx="6" fill="#eee" stroke="#ccc" stroke-width="0.5"/>
+  <text x="408" y="167" text-anchor="middle" font-size="12" fill="#555">/cp-4</text>
+  <text x="472" y="167" text-anchor="middle" font-size="12" fill="#888">...</text>
+
+  {/* Shared components row */}
+  <text x="340" y="202" text-anchor="middle" font-size="12" fill="#888">shared informer cache</text>
+  <rect x="128" y="210" width="90" height="28" rx="6" fill="#eee" stroke="#ccc" stroke-width="0.5"/>
+  <text x="173" y="229" text-anchor="middle" font-size="12" fill="#555">controllers</text>
+  <rect x="234" y="210" width="90" height="28" rx="6" fill="#eee" stroke="#ccc" stroke-width="0.5"/>
+  <text x="279" y="229" text-anchor="middle" font-size="12" fill="#555">scheduler</text>
+  <rect x="340" y="210" width="110" height="28" rx="6" fill="#eee" stroke="#ccc" stroke-width="0.5"/>
+  <text x="395" y="229" text-anchor="middle" font-size="12" fill="#555">etcd / Spanner</text>
+
+  {/* Arrows API server -> segments */}
+  <line x1="260" y1="118" x2="190" y2="146" stroke="#bbb" stroke-width="0.5" marker-end="url(#arrow)"/>
+  <line x1="300" y1="118" x2="276" y2="146" stroke="#bbb" stroke-width="0.5" marker-end="url(#arrow)"/>
+  <line x1="360" y1="118" x2="360" y2="146" stroke="#bbb" stroke-width="0.5" marker-end="url(#arrow)"/>
+  <line x1="410" y1="118" x2="444" y2="146" stroke="#bbb" stroke-width="0.5" marker-end="url(#arrow)"/>
+
+  {/* vCP endpoints row */}
+  <text x="340" y="298" text-anchor="middle" font-size="12" fill="#888">virtual control plane endpoints</text>
+  <rect x="108" y="308" width="82" height="34" rx="8" fill="#d4f0e8" stroke="#6dbfa0" stroke-width="0.5"/>
+  <text x="149" y="330" text-anchor="middle" font-size="12" fill="#0a5c3e">vCP 1</text>
+  <rect x="210" y="308" width="82" height="34" rx="8" fill="#d4f0e8" stroke="#6dbfa0" stroke-width="0.5"/>
+  <text x="251" y="330" text-anchor="middle" font-size="12" fill="#0a5c3e">vCP 2</text>
+  <rect x="312" y="308" width="82" height="34" rx="8" fill="#d4f0e8" stroke="#6dbfa0" stroke-width="0.5"/>
+  <text x="353" y="330" text-anchor="middle" font-size="12" fill="#0a5c3e">vCP 3</text>
+  <rect x="414" y="308" width="82" height="34" rx="8" fill="#d4f0e8" stroke="#6dbfa0" stroke-width="0.5"/>
+  <text x="455" y="330" text-anchor="middle" font-size="12" fill="#0a5c3e">vCP 4</text>
+  <text x="524" y="330" text-anchor="middle" font-size="12" fill="#888">~3 MB each</text>
+
+  {/* Arrows from management plane down to vCPs */}
+  <line x1="156" y1="264" x2="149" y2="306" stroke="#bbb" stroke-width="0.5" marker-end="url(#arrow)"/>
+  <line x1="240" y1="264" x2="251" y2="306" stroke="#bbb" stroke-width="0.5" marker-end="url(#arrow)"/>
+  <line x1="324" y1="264" x2="353" y2="306" stroke="#bbb" stroke-width="0.5" marker-end="url(#arrow)"/>
+  <line x1="408" y1="264" x2="455" y2="306" stroke="#bbb" stroke-width="0.5" marker-end="url(#arrow)"/>
+
+  {/* Shared pool under vCP 1 + 2 */}
+  <rect x="108" y="390" width="184" height="34" rx="8" fill="#eee" stroke="#ccc" stroke-width="0.5"/>
+  <text x="200" y="412" text-anchor="middle" font-size="12" fill="#555">shared node pool</text>
+  <line x1="149" y1="342" x2="160" y2="388" stroke="#bbb" stroke-width="0.5" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+  <line x1="251" y1="342" x2="240" y2="388" stroke="#bbb" stroke-width="0.5" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+
+  {/* Dedicated pool under vCP 3 */}
+  <rect x="312" y="390" width="82" height="34" rx="8" fill="#eee" stroke="#ccc" stroke-width="0.5"/>
+  <text x="353" y="412" text-anchor="middle" font-size="12" fill="#555">dedicated</text>
+  <line x1="353" y1="342" x2="353" y2="388" stroke="#bbb" stroke-width="0.5" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+
+  {/* GPU pool under vCP 4 */}
+  <rect x="414" y="390" width="82" height="34" rx="8" fill="#fef3d4" stroke="#e0b84a" stroke-width="0.5"/>
+  <text x="455" y="412" text-anchor="middle" font-size="12" fill="#7a5a00">GPU pool</text>
+  <line x1="455" y1="342" x2="455" y2="388" stroke="#bbb" stroke-width="0.5" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+
+  {/* kubectl client */}
+  <rect x="20" y="308" width="68" height="34" rx="8" fill="#eee" stroke="#ccc" stroke-width="0.5"/>
+  <text x="54" y="330" text-anchor="middle" font-size="12" fill="#555">kubectl</text>
+  <line x1="88" y1="325" x2="106" y2="325" stroke="#bbb" stroke-width="0.5" marker-end="url(#arrow)"/>
+  <text x="54" y="364" text-anchor="middle" font-size="11" fill="#aaa">Helm, ArgoCD</text>
+  <text x="54" y="378" text-anchor="middle" font-size="11" fill="#aaa">Terraform...</text>
+
+  {/* Legend */}
+  <line x1="108" y1="468" x2="136" y2="468" stroke="#bbb" stroke-width="0.5" stroke-dasharray="4 3"/>
+  <text x="144" y="472" font-size="11" fill="#aaa">schedules onto</text>
+</svg>
+
+Controllers and informers cache across tenants. When a new control plane is added, the marginal cost is the metadata for that plane's resources — around 3 MB — not a full duplicate of every controller's watch cache. Provisioning takes ~2 seconds because there is nothing to provision. No new process, no new datastore, no syncer to configure. The control plane exists as a partition within the shared API server the moment it's created.
+
+Workloads schedule directly onto shared or dedicated node pools. No resource copying between layers.
+
+---
+
+## The real question
+
+How many environments are you not creating because the overhead is too high?
+
+How many PRs share a staging environment because provisioning a new one takes too long? How many teams are constrained to a single cluster because running more would require a dedicated ops engineer to manage them? How many CI tests run against mocks because a real Kubernetes API was too expensive to spin up?
+
+Multiply that by the compounding cost of bad feedback loops, slower iteration, and bugs that only appear in production.
+
+The multi-tenancy problem has always been a forcing function on how fast and how safely you can ship. Getting it right isn't infrastructure work. It's product work.
+
+---
+
+**Give everyone a control plane.** [Get started](https://kplane.dev/#getting-started)
