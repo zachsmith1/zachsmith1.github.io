@@ -1,0 +1,42 @@
+---
+title: "agents don't actually want VMs"
+description: "Every cloud provider is racing to sell agents a VM. But agents don't want a box to rent — they want a cloud to own. Here's why the next primitive is the Agent Cloud, and why Kubernetes has to be rebuilt to deliver it."
+pubDate: 'May 24 2026'
+---
+
+Every cloud provider is racing to sell agents a VM. [Freestyle.sh](https://freestyle.sh), [Exe.dev](https://exe.dev), Vercel, Cloudflare, Google are all converging on the same primitive: spin up a sandbox, let the agent run a script, tear it down. For short-lived sessions, that's the right primitive. For anything that needs to outlive the session, it breaks.
+
+Agents are being asked to operate as if they're running locally, but that's not how production systems work. Developers reach for Docker Compose, Kubernetes, Terraform, and cloud services because a node isn't enough.
+
+We've seen this movie before. In the 2010s, companies outgrew VMs the same way agents are about to. They needed multi-service architectures, custom networking, stateful workloads, horizontal scale, cost control. Kubernetes won because it gave them the primitives of a cloud they could own and operate. Not a box, but a platform.
+
+---
+
+### The new primitive: Agent Clouds
+
+The base unit shouldn't be a VM an agent rents. It should be an isolated cloud an agent owns. VMs, storage, networking, identity, DNS, all as composable resources inside that cloud. Basically the agent gets root over a mini-AWS, not SSH into a box.
+
+The obvious move is to give each agent its own Kubernetes cluster. Clusters are the closest existing primitive to "a cloud you own": namespaces, RBAC, networking, storage, a real API. But the moment you try to operate this at agent scale, every assumption in the stack pushes back.
+
+A cluster takes minutes to provision, not seconds. A control plane costs more per month than most agent sessions will ever generate in value. Multi-tenancy inside a cluster is too soft for untrusted code; one cluster per tenant is too expensive to hand out by the million. The lifecycle is wrong too. Clusters are long-lived infrastructure managed by humans, but agent workloads are bursty, short, and created by software that doesn't care about upgrade windows.
+
+So the problem isn't "use Kubernetes." It's: take the primitives Kubernetes pioneered and rebuild them for a world where the tenant is an agent, not a team.
+
+---
+
+### The hard part
+
+1. **Instant, disposable, cheap at per-agent granularity.** A cloud has to spin up in seconds and cost cents, not minutes and dollars. Today's cluster provisioning is two orders of magnitude off.
+2. **Multi-tenancy designed for millions of tiny clouds, not thousands of big ones.** Hyperscalers optimized for a few large tenants per account boundary. Agent clouds invert the ratio. Small, numerous, and churned constantly.
+3. **A pricing model that survives agent economics.** You can't bill an agent cloud like an enterprise account. The unit economics have to work when the "customer" is a 30-second task.
+4. **Account-level isolation at container-level speed.** The same blast-radius guarantees AWS gives between accounts, but provisioned in the time it takes an agent to decide it needs one.
+
+If we can solve this then the future becomes more interesting. Agents can deploy full stack applications/software/infra across a wide range of use-cases. Agents can orchestrate multi service workflows. Agents can manage short or long-lived infrastructure on a user's behalf. Agents can collaborate by exposing services to each other across clouds.
+
+---
+
+### VMs are a product, not a platform
+
+The current wave is needed and it's driving most of the SOTA change we see currently. It's proving agents solve a wider range of tasks and do it efficiently, cheaply, safely. But I don't think the winner will be picked based on who has the fastest boot time. It will be whoever rebuilds the cloud primitive around the agent as the primary user.
+
+That's why we are building [kplane.dev](https://kplane.dev) and re-thinking how Kubernetes can orchestrate the next generation of agentic clouds.
